@@ -20,7 +20,6 @@ Run with:
 
 import re
 import io
-import copy
 import zipfile
 import requests
 import pandas as pd
@@ -64,10 +63,21 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────
 def default_state():
     """Return a FRESH dict of default session values every time it's called.
-    (Previously a single module-level dict was reused, so every reset
-    reassigned the *same* mutable {}/[] objects into session_state instead
-    of fresh ones — a latent state-corruption bug if anything mutated
-    those objects in place.)
+
+    Includes two "in-progress" flags (generating_plan / generating_code).
+    These exist purely to fix a UI glitch: previously each generate button
+    ran its slow, blocking AI call *inside the same script run* that drew
+    the button. While that run is still executing, Streamlit shows the
+    grey/stale remains of the PREVIOUS run underneath the live spinner,
+    which looks like the button + info box are duplicated on screen.
+
+    The fix is a tiny two-step state machine:
+      click button -> just set a flag + st.rerun() (near-instant run,
+                       nothing stale to leave behind)
+      next run     -> flag is set -> show ONLY a spinner, do the slow
+                       work, clear the flag, st.rerun() again
+    Each run's on-screen content is now either "just a button" or "just
+    a spinner", so there's nothing left over to render twice.
     """
     return {
         "crawled_pages": {},   # {url: html}
@@ -77,6 +87,8 @@ def default_state():
         "test_cases": "",
         "java_code": {},       # {filepath: code}
         "crawl_done": False,
+        "generating_plan": False,
+        "generating_code": False,
     }
 
 
@@ -625,7 +637,7 @@ with c1:
     url_input = st.text_input("URL", placeholder="https://automationexercise.com",
                                label_visibility="collapsed")
 with c2:
-    start_btn = st.button("🚀 Start", use_container_width=True, type="primary")
+    start_btn = st.button("🚀 Start", use_container_width=True, type="primary", key="start_btn")
 
 if start_btn:
     if not groq_api_key:
@@ -672,26 +684,38 @@ if st.session_state.crawl_done:
                 st.write(f"{i}. {u}")
 
         if st.session_state.test_plan or st.session_state.test_cases:
+            # ---- Results are ready: show them ----
             st.markdown("#### Test Plan")
             st.markdown(st.session_state.test_plan)
             st.markdown("---")
             st.markdown("#### Test Cases")
             st.markdown(fix_testcase_formatting(st.session_state.test_cases))
 
-            if st.button("🔄 Regenerate"):
+            if st.button("🔄 Regenerate", key="regen_plan_btn"):
                 st.session_state.test_plan = ""
                 st.session_state.test_cases = ""
                 st.session_state.java_code = {}  # stale code was built from old test cases
                 st.rerun()
+
+        elif st.session_state.generating_plan:
+            # ---- Step 2 of the state machine: do the slow work, alone ----
+            with st.spinner("AI is writing the test plan and test cases..."):
+                plan, cases = generate_plan_and_cases(
+                    groq_api_key, st.session_state.crawled_pages, st.session_state.locators
+                )
+                st.session_state.test_plan = plan
+                st.session_state.test_cases = cases
+                st.session_state.generating_plan = False
+            st.rerun()
+
         else:
+            # ---- Nothing generated yet: show the button ----
             st.info("One click generates both the Test Plan and the individual Test Cases.")
-            if st.button("📋 Generate Test Plan & Test Cases", type="primary"):
-                with st.spinner("AI is writing the test plan and test cases..."):
-                    plan, cases = generate_plan_and_cases(
-                        groq_api_key, st.session_state.crawled_pages, st.session_state.locators
-                    )
-                    st.session_state.test_plan = plan
-                    st.session_state.test_cases = cases
+            if st.button("📋 Generate Test Plan & Test Cases", type="primary", key="gen_plan_btn"):
+                # Step 1 of the state machine: just flip the flag and rerun
+                # immediately (fast), then the spinner branch above does
+                # the actual AI work on the next run.
+                st.session_state.generating_plan = True
                 st.rerun()
 
     # ── TAB 2: LOCATORS (auto-extracted, view only) ────────────
@@ -716,7 +740,8 @@ if st.session_state.crawl_done:
                     f"are actually relevant and will be used for Java code generation "
                     f"(down from {clean_count} unique / {len(locs)} raw)."
                 )
-                show_relevant_only = st.toggle("Show only test-relevant elements", value=True)
+                show_relevant_only = st.toggle("Show only test-relevant elements", value=True,
+                                                key="show_relevant_toggle")
             else:
                 show_relevant_only = False
                 st.caption(
@@ -731,7 +756,7 @@ if st.session_state.crawl_done:
 
             df = pd.DataFrame(display_locs)
             pages_opt = ["All Pages"] + sorted(df["Page"].unique().tolist())
-            sel = st.selectbox("Filter by Page", pages_opt)
+            sel = st.selectbox("Filter by Page", pages_opt, key="page_filter_select")
             filtered = df if sel == "All Pages" else df[df["Page"] == sel]
             st.dataframe(
                 filtered[["Page", "Tag", "Type", "Text / Label", "CSS Selector", "XPath"]],
@@ -739,7 +764,7 @@ if st.session_state.crawl_done:
             )
             st.caption(f"Showing {len(filtered)} of {len(display_locs)} elements")
 
-            if st.button("🔄 Re-extract Locators"):
+            if st.button("🔄 Re-extract Locators", key="reextract_btn"):
                 st.session_state.locators = extract_locators(st.session_state.crawled_pages)
                 st.session_state.java_code = {}
                 st.rerun()
@@ -758,6 +783,20 @@ if st.session_state.crawl_done:
                 "only from the elements your test cases actually reference."
             )
 
+        elif st.session_state.generating_code:
+            # ---- Step 2 of the state machine: do the slow work, alone ----
+            with st.spinner("AI is generating Selenium Java code... (~30s)"):
+                relevant_locators = get_relevant_locators(
+                    st.session_state.locators, st.session_state.test_cases
+                )
+                result = generate_java_code(
+                    groq_api_key, relevant_locators, st.session_state.crawled_pages
+                )
+                if result:
+                    st.session_state.java_code = result
+                st.session_state.generating_code = False
+            st.rerun()
+
         elif not st.session_state.java_code:
             relevant_locators = get_relevant_locators(
                 st.session_state.locators, st.session_state.test_cases
@@ -766,28 +805,24 @@ if st.session_state.crawl_done:
                 f"Ready to generate from **{len(relevant_locators)}** test-relevant elements "
                 f"(filtered from {len(st.session_state.locators)} raw elements found on the site)."
             )
-            if st.button("⚙️ Advance: Generate Java Code", type="primary"):
-                with st.spinner("AI is generating Selenium Java code... (~30s)"):
-                    result = generate_java_code(
-                        groq_api_key, relevant_locators, st.session_state.crawled_pages
-                    )
-                    if result:
-                        st.session_state.java_code = result
+            if st.button("⚙️ Advance: Generate Java Code", type="primary", key="gen_code_btn"):
+                # Step 1 of the state machine: just flip the flag and rerun
+                st.session_state.generating_code = True
                 st.rerun()
 
         else:
             # Code already generated -> show regenerate option + download section together
             st.success(f"✅ {len(st.session_state.java_code)} files generated for "
                        f"**{st.session_state.base_url}**")
-            if st.button("🔄 Regenerate Code"):
+            if st.button("🔄 Regenerate Code", key="regen_code_btn"):
                 st.session_state.java_code = {}
                 st.rerun()
 
             st.markdown("---")
             st.markdown("### 📥 Download")
 
-            c1, c2 = st.columns(2)
-            with c1:
+            dc1, dc2 = st.columns(2)
+            with dc1:
                 st.download_button(
                     "📦 Download Full Maven Project (.zip)",
                     data=create_zip(st.session_state.java_code),
@@ -795,8 +830,9 @@ if st.session_state.crawl_done:
                     mime="application/zip",
                     use_container_width=True,
                     type="primary",
+                    key="download_zip_btn",
                 )
-            with c2:
+            with dc2:
                 test_code = next(
                     (c for f, c in st.session_state.java_code.items() if "WebAppTest.java" in f), ""
                 )
@@ -807,6 +843,7 @@ if st.session_state.crawl_done:
                         file_name="WebAppTest.java",
                         mime="text/plain",
                         use_container_width=True,
+                        key="download_testfile_btn",
                     )
 
             st.markdown("---")
