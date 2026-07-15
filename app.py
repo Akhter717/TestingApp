@@ -7,6 +7,8 @@ Flow:
   2. Tab 1: Generate Test Plan + Test Cases together (one button)
   3. Tab 2: Review the auto-extracted locators (CSS + XPath)
   4. Tab 3: "Advance" -> Generate Selenium Java code (Page Objects + TestNG test)
+     -> uses only the locators that are actually relevant to the generated
+        test cases, not the full raw crawl dump
   5. Tab 4: Download everything as a ready-to-run Maven project (.zip)
 
 Requirements (pip install):
@@ -18,6 +20,7 @@ Run with:
 
 import re
 import io
+import copy
 import zipfile
 import requests
 import pandas as pd
@@ -50,7 +53,7 @@ with st.sidebar:
     st.markdown("1️⃣ Enter API key + URL, click Start")
     st.markdown("2️⃣ Tab 1 → Generate Test Plan + Test Cases")
     st.markdown("3️⃣ Tab 2 → Review Locators (auto-found)")
-    st.markdown("4️⃣ Tab 3 → Generate Java Code")
+    st.markdown("4️⃣ Tab 3 → Generate Java Code (uses only test-relevant locators)")
     st.markdown("5️⃣ Tab 4 → Download the project")
     st.markdown("---")
     st.caption(f"Model: `{GROQ_MODEL}`")
@@ -59,16 +62,25 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────
-DEFAULTS = {
-    "crawled_pages": {},   # {url: html}
-    "base_url": "",
-    "locators": [],        # list of dicts, auto-filled right after crawl
-    "test_plan": "",
-    "test_cases": "",
-    "java_code": {},       # {filepath: code}
-    "crawl_done": False,
-}
-for key, value in DEFAULTS.items():
+def default_state():
+    """Return a FRESH dict of default session values every time it's called.
+    (Previously a single module-level dict was reused, so every reset
+    reassigned the *same* mutable {}/[] objects into session_state instead
+    of fresh ones — a latent state-corruption bug if anything mutated
+    those objects in place.)
+    """
+    return {
+        "crawled_pages": {},   # {url: html}
+        "base_url": "",
+        "locators": [],        # full pool, auto-filled right after crawl
+        "test_plan": "",
+        "test_cases": "",
+        "java_code": {},       # {filepath: code}
+        "crawl_done": False,
+    }
+
+
+for key, value in default_state().items():
     st.session_state.setdefault(key, value)
 
 
@@ -144,8 +156,22 @@ def crawl_website(start_url, max_pages=15):
 # LOCATOR EXTRACTION
 # ─────────────────────────────────────────────────────────────
 SKIP_FIELD_NAMES = {"csrfmiddlewaretoken", "csrf_token", "_token", "__RequestVerificationToken"}
-INTERACTIVE_TAGS = ["input", "button", "a", "select", "textarea", "label"]
+# NOTE: "label" was removed — labels aren't actionable Selenium targets and
+# were just adding noise to an already-huge locator pool.
+INTERACTIVE_TAGS = ["input", "button", "a", "select", "textarea"]
 BARE_TAGS = set(INTERACTIVE_TAGS)
+
+# Cap how many raw elements we even look at per tag/page. This alone cuts
+# the raw pool size dramatically on large sites (was 20 per tag per page).
+MAX_ELEMENTS_PER_TAG_PER_PAGE = 12
+
+
+def _esc(val):
+    """Escape single quotes so we never emit a broken CSS/XPath attribute
+    selector like [aria-label='Don't show again'] (previously only XPath
+    text values were escaped, not attribute values in either CSS or XPath).
+    """
+    return (val or "").replace("'", "\\'")
 
 
 def build_locators(tag, elem):
@@ -153,7 +179,6 @@ def build_locators(tag, elem):
     eid = elem.get("id", "").strip()
     ename = elem.get("name", "").strip()
     eclasses = elem.get("class", [])
-    etype = elem.get("type", "").strip()
     eplace = elem.get("placeholder", "").strip()
     earia = elem.get("aria-label", "").strip()
     edata = elem.get("data-test", "").strip()
@@ -163,13 +188,13 @@ def build_locators(tag, elem):
     if eid:
         css = f"#{eid}"
     elif edata:
-        css = f"[data-test='{edata}']"
+        css = f"[data-test='{_esc(edata)}']"
     elif ename:
-        css = f"{tag}[name='{ename}']"
+        css = f"{tag}[name='{_esc(ename)}']"
     elif earia:
-        css = f"[aria-label='{earia}']"
+        css = f"[aria-label='{_esc(earia)}']"
     elif eplace:
-        css = f"{tag}[placeholder='{eplace}']"
+        css = f"{tag}[placeholder='{_esc(eplace)}']"
     elif eclasses:
         css = f"{tag}.{'.'.join(eclasses[:2])}"
     else:
@@ -177,20 +202,20 @@ def build_locators(tag, elem):
 
     # XPath: same priority, with visible text as a fallback for buttons/links
     if eid:
-        xpath = f"//{tag}[@id='{eid}']"
+        xpath = f"//{tag}[@id='{_esc(eid)}']"
     elif edata:
-        xpath = f"//{tag}[@data-test='{edata}']"
+        xpath = f"//{tag}[@data-test='{_esc(edata)}']"
     elif ename:
-        xpath = f"//{tag}[@name='{ename}']"
+        xpath = f"//{tag}[@name='{_esc(ename)}']"
     elif earia:
-        xpath = f"//{tag}[@aria-label='{earia}']"
+        xpath = f"//{tag}[@aria-label='{_esc(earia)}']"
     elif eplace:
-        xpath = f"//{tag}[@placeholder='{eplace}']"
-    elif etext and tag in ("button", "a", "label"):
-        safe = etext.replace("'", "\\'")[:30]
+        xpath = f"//{tag}[@placeholder='{_esc(eplace)}']"
+    elif etext and tag in ("button", "a"):
+        safe = _esc(etext)[:30]
         xpath = f"//{tag}[normalize-space()='{safe}']"
     elif eclasses:
-        xpath = f"//{tag}[contains(@class,'{eclasses[0]}')]"
+        xpath = f"//{tag}[contains(@class,'{_esc(eclasses[0])}')]"
     else:
         xpath = f"//{tag}"
 
@@ -207,7 +232,7 @@ def extract_locators(pages_dict):
         page_name = urlparse(url).path or "/"
 
         for tag in INTERACTIVE_TAGS:
-            for elem in soup.find_all(tag)[:20]:
+            for elem in soup.find_all(tag)[:MAX_ELEMENTS_PER_TAG_PER_PAGE]:
                 if elem.get("name", "") in SKIP_FIELD_NAMES or elem.get("type", "") == "hidden":
                     continue  # never turn hidden/CSRF fields into locators
 
@@ -251,6 +276,61 @@ def filter_unique_locators(page_locs):
         seen_css.add(loc["CSS Selector"])
         filtered.append(loc)
     return filtered
+
+
+def get_relevant_locators(all_locators, test_cases_text, max_per_page=8, max_total=40):
+    """Narrow the huge raw locator pool down to the elements that are
+    actually exercised by the generated test cases, so Java code generation
+    (and the resulting Page Objects) stay focused instead of dumping every
+    element found anywhere on the site.
+
+    Scoring is intentionally simple/deterministic (no extra AI call):
+      +2 if the element's page path is mentioned in the test case text
+      +1 for each word in the element's label/placeholder/name that shows
+         up in the test case text
+      +1 baseline boost for form controls (input/select/textarea/button),
+         since those are what test steps actually interact with far more
+         often than plain nav links
+    Falls back to the deduped pool (capped) if no test cases exist yet.
+    """
+    unique_pool = filter_unique_locators(all_locators)
+
+    if not test_cases_text or not unique_pool:
+        return unique_pool[:max_total]
+
+    text_lower = test_cases_text.lower()
+    scored = []
+    for loc in unique_pool:
+        label = (loc.get("Text / Label") or "").lower()
+        page = (loc.get("Page") or "").lower()
+        score = 0
+
+        if page and page != "/" and page in text_lower:
+            score += 2
+
+        for word in re.findall(r"[a-zA-Z]{3,}", label):
+            if word in text_lower:
+                score += 1
+
+        if loc["Tag"] in ("input", "select", "textarea", "button"):
+            score += 1
+
+        scored.append((score, loc))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    result = []
+    per_page_count = {}
+    for score, loc in scored:
+        p = loc["Page"]
+        if per_page_count.get(p, 0) >= max_per_page:
+            continue
+        result.append(loc)
+        per_page_count[p] = per_page_count.get(p, 0) + 1
+        if len(result) >= max_total:
+            break
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
@@ -372,13 +452,16 @@ def generate_java_code(api_key, locators, pages_dict):
     if not pages_dict:
         st.error("❌ No crawled pages. Cannot generate Java code.")
         return {}
+    if not locators:
+        st.error("❌ No relevant locators to build code from.")
+        return {}
 
     base_url = st.session_state.base_url or list(pages_dict.keys())[0].rstrip("/")
     java_files = {}
 
     # Group locators by page, and remember each page's real crawled URL
     pages, page_url_lookup = {}, {}
-    for loc in locators[:50]:
+    for loc in locators:
         page_key = loc["Page"].strip("/").replace("/", "_").replace("-", "_") or "home"
         page_url_lookup.setdefault(page_key, loc.get("_url", base_url))
         pages.setdefault(page_key, []).append(loc)
@@ -429,7 +512,7 @@ Requirements:
     ]
     sample = "\n".join(
         f'  [{l["Tag"]}] "{l["Text / Label"]}" CSS: {l["CSS Selector"]} | XPath: {l["XPath"]}'
-        for l in filter_unique_locators(locators[:30])[:20]
+        for l in filter_unique_locators(locators)[:20]
     )
 
     test_prompt = f"""
@@ -552,7 +635,7 @@ if start_btn:
         st.error("❌ Please enter a valid URL starting with http:// or https://")
         st.stop()
 
-    for k, v in DEFAULTS.items():
+    for k, v in default_state().items():
         st.session_state[k] = v
     st.session_state.base_url = url_input.rstrip("/")
 
@@ -598,6 +681,7 @@ if st.session_state.crawl_done:
             if st.button("🔄 Regenerate"):
                 st.session_state.test_plan = ""
                 st.session_state.test_cases = ""
+                st.session_state.java_code = {}  # stale code was built from old test cases
                 st.rerun()
         else:
             st.info("One click generates both the Test Plan and the individual Test Cases.")
@@ -623,14 +707,29 @@ if st.session_state.crawl_done:
             )
         else:
             clean_count = len(filter_unique_locators(locs))
-            st.success(f"✅ Found **{len(locs)} elements**.")
-            if clean_count < len(locs):
+            st.success(f"✅ Found **{len(locs)} elements** in the raw crawl.")
+
+            if st.session_state.test_cases:
+                relevant = get_relevant_locators(locs, st.session_state.test_cases)
                 st.info(
-                    f"ℹ️ **{clean_count} unique elements** will be used for Java code "
-                    f"({len(locs) - clean_count} ambiguous/duplicate ones are skipped)."
+                    f"🎯 Based on your generated test cases, **{len(relevant)} elements** "
+                    f"are actually relevant and will be used for Java code generation "
+                    f"(down from {clean_count} unique / {len(locs)} raw)."
+                )
+                show_relevant_only = st.toggle("Show only test-relevant elements", value=True)
+            else:
+                show_relevant_only = False
+                st.caption(
+                    "ℹ️ Generate Test Plan & Test Cases in Tab 1 first — this list will then "
+                    "narrow down to only the elements your test cases actually use."
                 )
 
-            df = pd.DataFrame(locs)
+            display_locs = (
+                get_relevant_locators(locs, st.session_state.test_cases)
+                if show_relevant_only else locs
+            )
+
+            df = pd.DataFrame(display_locs)
             pages_opt = ["All Pages"] + sorted(df["Page"].unique().tolist())
             sel = st.selectbox("Filter by Page", pages_opt)
             filtered = df if sel == "All Pages" else df[df["Page"] == sel]
@@ -638,7 +737,7 @@ if st.session_state.crawl_done:
                 filtered[["Page", "Tag", "Type", "Text / Label", "CSS Selector", "XPath"]],
                 use_container_width=True, height=400,
             )
-            st.caption(f"Showing {len(filtered)} of {len(locs)} elements")
+            st.caption(f"Showing {len(filtered)} of {len(display_locs)} elements")
 
             if st.button("🔄 Re-extract Locators"):
                 st.session_state.locators = extract_locators(st.session_state.crawled_pages)
@@ -653,13 +752,24 @@ if st.session_state.crawl_done:
         if not st.session_state.locators:
             st.warning("⚠️ No locators available. Crawl a site with more interactive elements.")
 
+        elif not st.session_state.test_cases:
+            st.warning(
+                "⚠️ Generate the Test Plan & Test Cases in Tab 1 first — Java code is generated "
+                "only from the elements your test cases actually reference."
+            )
+
         elif not st.session_state.java_code:
-            clean_count = len(filter_unique_locators(st.session_state.locators))
-            st.info(f"Ready to generate from **{clean_count} unique elements**.")
+            relevant_locators = get_relevant_locators(
+                st.session_state.locators, st.session_state.test_cases
+            )
+            st.info(
+                f"Ready to generate from **{len(relevant_locators)}** test-relevant elements "
+                f"(filtered from {len(st.session_state.locators)} raw elements found on the site)."
+            )
             if st.button("⚙️ Advance: Generate Java Code", type="primary"):
                 with st.spinner("AI is generating Selenium Java code... (~30s)"):
                     result = generate_java_code(
-                        groq_api_key, st.session_state.locators, st.session_state.crawled_pages
+                        groq_api_key, relevant_locators, st.session_state.crawled_pages
                     )
                     if result:
                         st.session_state.java_code = result
